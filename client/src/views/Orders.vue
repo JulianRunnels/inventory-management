@@ -5,6 +5,41 @@
       <p>{{ t('orders.description') }}</p>
     </div>
 
+    <div class="card">
+      <div class="card-header">
+        <h3 class="card-title">{{ t('orders.submittedOrders') }} ({{ submittedOrders.length }})</h3>
+      </div>
+      <div v-if="submittedLoading" class="loading">{{ t('common.loading') }}</div>
+    <div v-else-if="submittedError" class="error">{{ submittedError }}</div>
+    <div v-else-if="submittedOrders.length === 0" class="loading">{{ t('orders.noSubmitted') }}</div>
+      <div v-else class="table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>{{ t('orders.table.orderNumber') }}</th>
+              <th>{{ t('orders.table.orderDate') }}</th>
+              <th>{{ t('orders.itemCount') }}</th>
+              <th>{{ t('orders.table.totalValue') }}</th>
+              <th>{{ t('orders.leadTime') }}</th>
+              <th>{{ t('orders.expectedDelivery') }}</th>
+              <th>{{ t('orders.table.status') }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="order in submittedOrders" :key="order.id">
+              <td><strong>{{ order.order_number }}</strong></td>
+              <td>{{ formatDateOnly(order.submitted_date) }}</td>
+              <td>{{ order.items.length }}</td>
+              <td><strong>{{ formatCurrencyWithDecimals(order.total_cost, currentCurrency, 2) }}</strong></td>
+              <td>{{ t('restocking.days', { count: order.lead_time_days }) }}</td>
+              <td>{{ formatDateOnly(order.expected_delivery) }}</td>
+              <td><span class="badge info">{{ t('status.submitted') }}</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <div v-if="loading" class="loading">{{ t('common.loading') }}</div>
     <div v-else-if="error" class="error">{{ error }}</div>
     <div v-else>
@@ -83,6 +118,7 @@ import { ref, onMounted, watch, computed } from 'vue'
 import { api } from '../api'
 import { useFilters } from '../composables/useFilters'
 import { useI18n } from '../composables/useI18n'
+import { formatCurrency, formatCurrencyWithDecimals } from '../utils/currency'
 
 export default {
   name: 'Orders',
@@ -95,6 +131,10 @@ export default {
     const loading = ref(true)
     const error = ref(null)
     const orders = ref([])
+    // Restock orders live in their own ref: they ignore the global filters and don't affect the stat cards
+    const submittedOrders = ref([])
+    const submittedLoading = ref(true)
+    const submittedError = ref(null)
 
     // Use shared filters
     const {
@@ -153,13 +193,45 @@ export default {
       })
     }
 
-    onMounted(loadOrders)
+    // Date-only strings (YYYY-MM-DD) parse as UTC with new Date(s); parse as local time instead
+    const formatDateOnly = (dateString) => {
+      const date = new Date(`${dateString}T00:00:00`)
+      if (isNaN(date.getTime())) return '-'
+      const { currentLocale } = useI18n()
+      const locale = currentLocale.value === 'ja' ? 'ja-JP' : 'en-US'
+      return date.toLocaleDateString(locale, { year: 'numeric', month: 'short', day: 'numeric' })
+    }
+
+    const loadSubmittedOrders = async () => {
+      try {
+        submittedLoading.value = true
+        submittedError.value = null
+        submittedOrders.value = await api.getRestockOrders()
+      } catch (err) {
+        submittedError.value = 'Failed to load submitted orders: ' + err.message
+        console.error('Failed to load submitted orders:', err)
+      } finally {
+        submittedLoading.value = false
+      }
+    }
+
+    onMounted(() => {
+      loadOrders()
+      loadSubmittedOrders()
+    })
 
     return {
       t,
       loading,
       error,
       orders,
+      submittedOrders,
+      submittedLoading,
+      submittedError,
+      formatDateOnly,
+      formatCurrencyWithDecimals,
+      currentCurrency,
+      formatCurrency,
       getOrdersByStatus,
       getOrderStatusClass,
       formatDate,
