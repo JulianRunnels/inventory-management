@@ -1,7 +1,13 @@
-from fastapi import FastAPI, HTTPException
+import math
+from datetime import date, timedelta
+from threading import Lock
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
 
 app = FastAPI(title="Factory Inventory Management System")
@@ -46,6 +52,26 @@ def apply_filters(items: list, warehouse: Optional[str] = None, category: Option
 
     return filtered
 
+def _json_safe(value):
+    """Replace non-finite floats, which JSON can't represent, with their string form"""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    return value
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Same 422 shape as FastAPI's default handler, but safe to serialize.
+
+    The default handler echoes the rejected input back. When a client sends
+    Infinity or NaN (which the JSON parser accepts), that echo can't be encoded
+    and the 422 turns into a 500.
+    """
+    return JSONResponse(status_code=422, content={"detail": _json_safe(jsonable_encoder(exc.errors()))})
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -89,6 +115,8 @@ class DemandForecast(BaseModel):
     forecasted_demand: int
     trend: str
     period: str
+    unit_cost: float
+    lead_time_days: int
 
 class BacklogItem(BaseModel):
     id: str
@@ -119,6 +147,97 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockLineItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+    line_total: float
+    lead_time_days: int
+    trend: str
+
+class RestockRecommendation(BaseModel):
+    budget: float
+    items: List[RestockLineItem]
+    total_cost: float
+    remaining_budget: float
+
+MAX_RESTOCK_BUDGET = 1_000_000
+
+class RestockOrderItemRequest(BaseModel):
+    sku: str
+    quantity: int
+
+class CreateRestockOrderRequest(BaseModel):
+    # allow_inf_nan=False matters: the JSON parser accepts Infinity/NaN, and storing
+    # one would make every later GET /api/restock-orders fail to serialize.
+    budget: float = Field(ge=0, le=MAX_RESTOCK_BUDGET, allow_inf_nan=False)
+    items: List[RestockOrderItemRequest]
+
+class RestockOrder(BaseModel):
+    id: str
+    order_number: str
+    items: List[RestockLineItem]
+    total_cost: float
+    budget: float
+    status: str
+    submitted_date: str
+    lead_time_days: int
+    expected_delivery: str
+
+# Submitted restock orders live only in process memory, matching the rest of the
+# app's no-database design; they are cleared whenever the server restarts.
+restock_orders: List[dict] = []
+# Sync endpoints run in a threadpool; the lock keeps order numbers unique when
+# two orders are submitted at the same time.
+restock_orders_lock = Lock()
+
+# Lower rank = restock first. Rising demand is the most urgent to cover.
+TREND_PRIORITY = {'increasing': 0, 'stable': 1, 'decreasing': 2}
+
+def build_line_item(forecast: dict, quantity: int) -> dict:
+    """Price a forecast item at the server-side unit cost"""
+    return {
+        'sku': forecast['item_sku'],
+        'name': forecast['item_name'],
+        'quantity': quantity,
+        'unit_cost': forecast['unit_cost'],
+        'line_total': round(quantity * forecast['unit_cost'], 2),
+        'lead_time_days': forecast['lead_time_days'],
+        'trend': forecast['trend'],
+    }
+
+def recommend_restock(budget: float) -> dict:
+    """Greedily fill the budget with forecast items that have a demand gap"""
+    candidates = [f for f in demand_forecasts if f['forecasted_demand'] > f['current_demand']]
+    # Highest-urgency trend first, then the largest shortfall within each trend.
+    candidates.sort(key=lambda f: (TREND_PRIORITY.get(f['trend'], len(TREND_PRIORITY)),
+                                   -(f['forecasted_demand'] - f['current_demand'])))
+
+    items = []
+    # Work in integer cents so float error can't under- or over-fill a line
+    # (e.g. 0.3 // 0.1 == 2.0 in floating point).
+    remaining_cents = int(round(budget * 100))
+    for forecast in candidates:
+        gap = forecast['forecasted_demand'] - forecast['current_demand']
+        cost_cents = int(round(forecast['unit_cost'] * 100))
+        # Buy as much of the gap as the budget allows. An item that only partly fits
+        # is partially filled, and we keep going (rather than stopping) so cheaper
+        # items further down the list can still use the leftover budget.
+        quantity = min(gap, remaining_cents // cost_cents)
+        if quantity <= 0:
+            continue
+        items.append(build_line_item(forecast, quantity))
+        remaining_cents -= quantity * cost_cents
+
+    total_cost = round(sum(line['line_total'] for line in items), 2)
+    return {
+        'budget': budget,
+        'items': items,
+        'total_cost': total_cost,
+        'remaining_budget': round(budget - total_cost, 2),
+    }
 
 # API endpoints
 @app.get("/")
@@ -303,6 +422,63 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restock/recommendations", response_model=RestockRecommendation)
+def get_restock_recommendations(budget: float = Query(..., ge=0, le=MAX_RESTOCK_BUDGET, allow_inf_nan=False)):
+    """Recommend forecast items to restock within the given budget"""
+    return recommend_restock(budget)
+
+@app.get("/api/restock-orders", response_model=List[RestockOrder])
+def get_restock_orders():
+    """Get submitted restock orders, newest first"""
+    return list(reversed(restock_orders))
+
+@app.post("/api/restock-orders", response_model=RestockOrder, status_code=201)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Submit a restock order"""
+    if not request.items:
+        raise HTTPException(status_code=400, detail="Restock order must contain at least one item")
+
+    skus = [requested.sku for requested in request.items]
+    if len(skus) != len(set(skus)):
+        raise HTTPException(status_code=400, detail="Each SKU may appear only once per restock order")
+
+    forecasts_by_sku = {f['item_sku']: f for f in demand_forecasts}
+    items = []
+    for requested in request.items:
+        forecast = forecasts_by_sku.get(requested.sku)
+        if not forecast:
+            raise HTTPException(status_code=400, detail=f"Unknown SKU {requested.sku}")
+        if requested.quantity <= 0:
+            raise HTTPException(status_code=400, detail=f"Quantity for {requested.sku} must be positive")
+        # Price from server-side data so the client can't submit its own unit costs.
+        items.append(build_line_item(forecast, requested.quantity))
+
+    total_cost = round(sum(line['line_total'] for line in items), 2)
+    if total_cost > request.budget:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Order total {total_cost:.2f} exceeds budget {request.budget:.2f}"
+        )
+
+    # The order arrives complete, so it ships when its slowest item does.
+    lead_time_days = max(line['lead_time_days'] for line in items)
+    submitted = date.today()
+    with restock_orders_lock:
+        order_number = len(restock_orders) + 1
+        order = {
+            'id': str(order_number),
+            'order_number': f"RST-{order_number:04d}",
+            'items': items,
+            'total_cost': total_cost,
+            'budget': request.budget,
+            'status': 'Submitted',
+            'submitted_date': submitted.isoformat(),
+            'lead_time_days': lead_time_days,
+            'expected_delivery': (submitted + timedelta(days=lead_time_days)).isoformat(),
+        }
+        restock_orders.append(order)
+    return order
 
 if __name__ == "__main__":
     import uvicorn

@@ -6,6 +6,7 @@ export default {
     orders: 'Orders',
     finance: 'Finance',
     demandForecast: 'Demand Forecast',
+    restocking: 'Restocking',
     companyName: 'Catalyst Components',
     subtitle: 'Inventory Management System'
   },
@@ -106,6 +107,11 @@ export default {
     title: 'Orders',
     description: 'View and manage customer orders',
     allOrders: 'All Orders',
+    submittedOrders: 'Submitted Orders',
+    leadTime: 'Lead Time',
+    expectedDelivery: 'Expected Delivery',
+    itemCount: 'Items',
+    noSubmitted: 'No submitted restock orders',
     totalOrders: 'Total Orders',
     totalRevenue: 'Total Revenue',
     avgOrderValue: 'Avg Order Value',
@@ -167,6 +173,34 @@ export default {
     }
   },
 
+  // Restocking
+  restocking: {
+    title: 'Restocking',
+    description: 'Get budget-based restock recommendations and place a restock order',
+    budget: 'Budget',
+    totalCost: 'Total Cost',
+    remainingBudget: 'Remaining Budget',
+    itemCount: 'Items',
+    recommendations: 'Recommendations',
+    sku: 'SKU',
+    name: 'Name',
+    trend: 'Trend',
+    quantity: 'Quantity',
+    unitCost: 'Unit Cost',
+    lineTotal: 'Line Total',
+    leadTime: 'Lead Time',
+    days: '{count} days',
+    placeOrder: 'Place Order',
+    placing: 'Placing...',
+    noItems: 'No recommended items for this budget',
+    orderPlaced: 'Order {orderNumber} placed successfully.',
+    orderFailed: 'Failed to place order. Please try again.',
+    viewOrders: 'View Orders',
+    increasing: 'Increasing',
+    stable: 'Stable',
+    decreasing: 'Decreasing'
+  },
+
   // Demand Forecast
   demand: {
     title: 'Demand Forecast',
@@ -204,6 +238,7 @@ export default {
     shipped: 'Shipped',
     processing: 'Processing',
     backordered: 'Backordered',
+    submitted: 'Submitted',
     inStock: 'In Stock',
     lowStock: 'Low Stock',
     adequate: 'Adequate'
